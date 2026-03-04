@@ -1,4 +1,10 @@
 import streamlit as st
+try:
+    api_key = st.secrets["AVIATIONSTACK_API_KEY"]
+    st.write("✅ API key loaded from secrets (length:", len(api_key), "chars)")
+except Exception as e:
+    st.error(f"❌ Secrets failed: {str(e)}")
+    api_key = None
 import requests
 import sqlite3
 import pandas as pd
