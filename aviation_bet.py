@@ -176,7 +176,7 @@ st.title("✈️ SkyStake – Stake SkyCoins on Real Flights ✈️")
 try:
     api_key = st.secrets["AVIATIONSTACK_API_KEY"]
 except:
-    st.sidebar.warning("No API key in secrets – sample data only.")
+    st.sidebar.warning("No API key in secrets – using sample data only.")
     api_key = None
 
 if 'user' not in st.session_state:
@@ -221,7 +221,6 @@ if st.session_state.user:
         st.session_state.user = None
         st.rerun()
 
-    # User's bets summary
     st.sidebar.subheader("Your Bets Today")
     c.execute("SELECT flight_id, bet_type, delay_range, outcome FROM bets WHERE username=? AND bet_date=?", (user, today_str))
     current_bets = c.fetchall()
@@ -246,7 +245,6 @@ if st.session_state.user:
         now = datetime.utcnow()
         
         for idx, row in flights_df.iterrows():
-            # Safe parsing of scheduled time
             try:
                 sched_dt = parser.parse(row['scheduled']) if row['scheduled'] else datetime.max
                 time_str = sched_dt.strftime("%H:%M UTC")
@@ -268,12 +266,11 @@ if st.session_state.user:
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Bet button per flight
                 if st.button("Place Bet on this flight", key=f"bet_btn_{idx}"):
                     st.session_state.selected_flight = row.to_dict()
                     st.rerun()
 
-        # Bet form (shows when a flight is selected)
+        # Bet form when flight selected
         if 'selected_flight' in st.session_state:
             flight = st.session_state.selected_flight
             flight_id = flight['flight_id']
@@ -286,34 +283,55 @@ if st.session_state.user:
             if pending_bets >= 5:
                 st.warning("You have reached the daily limit of 5 bets.")
             else:
-                # Check if flight already departed
-                try:
-                    sched_dt = parser.parse(flight['scheduled']) if flight['scheduled'] else datetime.max
-                    if sched_dt < now:
-                        st.error("This flight has already departed – betting not allowed.")
-                    else:
-                        with st.form("bet_form"):
-                            bet_type = st.radio("Your Prediction", ["On Time (<15 min delay)", "Delayed", "Cancelled"])
-                            delay_range = ""
-                            if bet_type == "Delayed":
-                                delay_range = st.selectbox("Expected Delay", ["Under 20 min", "20–60 min", ">60 min"])
-                            
-                            if st.form_submit_button("Confirm Bet ✈️"):
-                                c.execute("INSERT OR REPLACE INTO bets VALUES (?, ?, ?, ?, ?, 'pending')",
-                                          (user, flight_id, bet_type, delay_range, today_str))
-                                conn.commit()
-                                st.success(f"Bet placed on {flight_id}!")
-                                del st.session_state.selected_flight
-                                st.rerun()
-                except:
-                    st.error("Cannot determine flight time – betting disabled for this flight.")
+                can_bet = True
+                time_message = None
                 
-                if st.button("Cancel / Close"):
+                try:
+                    sched_str = flight.get('scheduled')
+                    if sched_str:
+                        sched_dt = parser.parse(sched_str)
+                        if sched_dt < now:
+                            can_bet = False
+                            time_message = "This flight has already departed – betting not allowed."
+                    else:
+                        time_message = "No scheduled departure time available – you can still place a bet."
+                except Exception as parse_error:
+                    time_message = f"Could not read departure time – betting still allowed. ({str(parse_error)})"
+                
+                if time_message:
+                    if can_bet:
+                        st.warning(time_message)
+                    else:
+                        st.error(time_message)
+                        if st.button("Close"):
+                            if 'selected_flight' in st.session_state:
+                                del st.session_state.selected_flight
+                            st.rerun()
+                        # Stop rendering form if cannot bet
+                        st.stop()
+                
+                with st.form("bet_form"):
+                    bet_type = st.radio("Your Prediction", ["On Time (<15 min delay)", "Delayed", "Cancelled"])
+                    delay_range = ""
+                    if bet_type == "Delayed":
+                        delay_range = st.selectbox("Expected Delay", ["Under 20 min", "20–60 min", ">60 min"])
+                    
+                    if st.form_submit_button("Confirm Bet ✈️"):
+                        c.execute("INSERT OR REPLACE INTO bets VALUES (?, ?, ?, ?, ?, 'pending')",
+                                  (user, flight_id, bet_type, delay_range, today_str))
+                        conn.commit()
+                        st.success(f"Bet placed successfully on {flight_id}!")
+                        if 'selected_flight' in st.session_state:
+                            del st.session_state.selected_flight
+                        st.rerun()
+            
+            if st.button("Cancel / Close form"):
+                if 'selected_flight' in st.session_state:
                     del st.session_state.selected_flight
-                    st.rerun()
+                st.rerun()
 
     else:
-        st.info("No flights loaded yet. Press Refresh Flights.")
+        st.info("No flights loaded yet. Try refreshing.")
 
     # Leaderboard
     st.subheader("Global Leaderboard")
@@ -324,9 +342,9 @@ if st.session_state.user:
         st.markdown(f"{emoji} **{row['username']}** – {row['skycoins']} SkyCoins ({lvl})")
 
     # Resolution
-    st.subheader("Admin / Resolve")
+    st.subheader("Resolve Bets")
     if st.button("Resolve Today's Bets"):
         count = resolve_bets(api_key, today_str) if api_key else 0
         st.success(f"Resolved {count} bets.")
 
-st.caption("SkyStake v1.0 • Real-time only • Codeshares excluded • Click card to bet")
+st.caption("SkyStake • Real-time departures • Click card to bet • AviationStack powered")
