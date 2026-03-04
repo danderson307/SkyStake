@@ -178,11 +178,11 @@ st.markdown("""
 
 st.title("✈️ SkyStake – Stake SkyCoins on Real Flights ✈️")
 
-# API key (from secrets or fallback sample)
+# API key
 try:
     api_key = st.secrets["AVIATIONSTACK_API_KEY"]
 except:
-    st.sidebar.warning("No API key found in secrets – using sample data.")
+    st.sidebar.warning("No API key – using sample data.")
     api_key = None
 
 if 'user' not in st.session_state:
@@ -227,7 +227,7 @@ if st.session_state.user:
         st.session_state.user = None
         st.rerun()
 
-    # Additional feature: Show user's current bets
+    # User's current bets
     st.sidebar.subheader("Your Bets Today")
     c.execute("SELECT flight_id, bet_type, delay_range, outcome FROM bets WHERE username=? AND bet_date=?", (user, today_str))
     current_bets = c.fetchall()
@@ -235,7 +235,7 @@ if st.session_state.user:
         for bet in current_bets:
             st.sidebar.markdown(f"- {bet[0]}: {bet[1]} ({bet[2]}) – {bet[3].capitalize()}")
     else:
-        st.sidebar.info("No bets placed yet today.")
+        st.sidebar.info("No bets yet today.")
 
     st.subheader(f"Current Manchester Departures – {today_str}")
 
@@ -248,16 +248,25 @@ if st.session_state.user:
     flights_df = st.session_state.get('flights', pd.DataFrame())
 
     if not flights_df.empty:
+        now = datetime.utcnow()
+        
         for _, row in flights_df.iterrows():
-            # Additional feature: Highlight upcoming flights (green if scheduled > now)
-            now = datetime.utcnow()
-            sched = parser.parse(row['scheduled']) if row['scheduled'] else now
-            color = "#88ff88" if sched > now else "#ff8888"
+            # Parse scheduled time safely
+            try:
+                sched_dt = parser.parse(row['scheduled']) if row['scheduled'] else datetime.max
+                is_upcoming = sched_dt > now
+                time_str = sched_dt.strftime("%H:%M") if row['scheduled'] else 'N/A'
+            except (ValueError, TypeError):
+                is_upcoming = False
+                time_str = 'N/A'
+            
+            color = "#88ff88" if is_upcoming else "#ff8888"
+            
             st.markdown(f"""
             <div class="card" style="border-left: 5px solid {color};">
                 <h3><i class="fa fa-plane-departure"></i> {row['flight_id']} – {row['airline']}</h3>
                 <p><strong>To:</strong> {row['destination']} ({row['dest_iata']})</p>
-                <p><strong>Scheduled:</strong> {row['scheduled'][-14:-6] if row['scheduled'] else 'N/A'}</p>
+                <p><strong>Scheduled:</strong> {time_str} UTC</p>
                 <p><strong>Status:</strong> {row['status_emoji']} {row['status']}</p>
                 <p><strong>Insight:</strong> {row['otp_rating']}</p>
             </div>
@@ -278,7 +287,6 @@ if st.session_state.user:
                     delay_range = "" if bet_type != "Delayed" else st.selectbox("Delay Range", ["Under 20 min", "20–60 min", ">60 min"])
                     
                     if st.form_submit_button("Place Bet ✈️"):
-                        # Validation: Can't bet on past flights
                         sched = flights_df[flights_df['flight_id'] == selected_flight_id]['scheduled'].iloc[0]
                         if sched and parser.parse(sched) < datetime.utcnow():
                             st.error("Cannot bet on past flights.")
@@ -294,7 +302,7 @@ if st.session_state.user:
     else:
         st.info("No flights available. Try refreshing.")
 
-    # Additional feature: Leaderboard in main UI
+    # Leaderboard
     st.subheader("Global Leaderboard")
     leaders = pd.read_sql("SELECT username, skycoins FROM users ORDER BY skycoins DESC LIMIT 10", conn)
     for i, row in leaders.iterrows():
