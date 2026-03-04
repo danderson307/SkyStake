@@ -25,26 +25,23 @@ ROUTE_RATINGS = {
     'DEFAULT': {'otp': 74, 'avg_delay_min': 20, 'risk': 'Medium'}
 }
 
-# ---------------- Fetch Departures with debug ----------------
-@st.cache_data(ttl=1800, show_spinner="Fetching Manchester departures...")
-def fetch_departures(api_key, flight_date_str):
-    # Try HTTPS first (current recommendation for most accounts)
+# ---------------- Fetch Departures (free tier real-time mode) ----------------
+@st.cache_data(ttl=1800, show_spinner="Fetching current Manchester departures...")
+def fetch_departures(api_key):
     url = "https://api.aviationstack.com/v1/flights"
-    # If HTTPS fails with access restricted, change to:
-    # url = "http://api.aviationstack.com/v1/flights"
+    # If you get https_access_restricted again → change to: "http://api.aviationstack.com/v1/flights"
 
     params = {
         'access_key': api_key,
         'dep_iata': 'MAN',
-        'flight_date': flight_date_str,
         'limit': 50
+        # IMPORTANT: flight_date is OMITTED → keeps us in real-time mode (free tier allowed)
     }
     
     try:
         r = requests.get(url, params=params, timeout=10)
         
-        # ────────────────────────────────────────────────
-        # DEBUG OUTPUT - these lines show what the API actually returned
+        # Debug output
         st.write("**API Debug Info**")
         st.write("API Status Code:", r.status_code)
         
@@ -57,14 +54,15 @@ def fetch_departures(api_key, flight_date_str):
         st.write("API Response Keys:", list(data.keys()))
         
         if 'data' in data:
-            st.write("Number of flights returned:", len(data['data']))
-            if len(data['data']) == 0:
-                st.info("API returned success (200) but zero flights for this date/airport.")
+            flight_count = len(data['data'])
+            st.write("Number of flights returned:", flight_count)
+            if flight_count == 0:
+                st.info("API success (200) but zero current flights from MAN right now.")
         else:
             st.warning("No 'data' key in response. Full response preview:")
             st.json(data)
-        # ────────────────────────────────────────────────
         
+        # Parse flights
         flights = []
         for f in data.get('data', []):
             dep = f.get('departure', {})
@@ -85,9 +83,10 @@ def fetch_departures(api_key, flight_date_str):
                 'status_emoji': {'Scheduled': '🛫', 'Active': '✈️', 'Landed': '🛬', 'Cancelled': '❌'}.get(status, '❓'),
                 'otp_rating': f"{rating['otp']}% • Avg {rating['avg_delay_min']} min • {rating['risk']}"
             })
+        
         df = pd.DataFrame(flights)
         if not df.empty:
-            st.success(f"Successfully parsed {len(df)} flights!")
+            st.success(f"Successfully loaded {len(df)} current flights!")
         return df
     
     except Exception as e:
@@ -96,11 +95,13 @@ def fetch_departures(api_key, flight_date_str):
 
 # ---------------- Resolve Bets ----------------
 def resolve_bets(api_key, target_date):
-    flights_df = fetch_departures(api_key, target_date)
+    flights_df = fetch_departures(api_key)  # Using real-time fetch
     if flights_df.empty:
         return 0
+    
     flight_map = {row['flight_id']: row for _, row in flights_df.iterrows()}
     updated = 0
+    
     c.execute("SELECT username, flight_id, bet_type, delay_range FROM bets WHERE bet_date = ? AND outcome = 'pending'", (target_date,))
     for user, flight_id, bet_type, delay_range in c.fetchall():
         if flight_id not in flight_map:
@@ -108,6 +109,7 @@ def resolve_bets(api_key, target_date):
         f = flight_map[flight_id]
         status = f['status']
         delay_min = f['delay_min'] if f['delay_min'] is not None else 0
+        
         if delay_min == 0 and f['actual'] and f['scheduled']:
             try:
                 sched = parser.parse(f['scheduled'])
@@ -115,11 +117,14 @@ def resolve_bets(api_key, target_date):
                 delay_min = max(0, (act - sched).total_seconds() / 60)
             except:
                 pass
+        
         is_cancelled = status == 'Cancelled'
         is_on_time = not is_cancelled and delay_min <= 15
         is_delayed = not is_cancelled and delay_min > 15
+        
         correct = False
         coins = 0
+        
         if bet_type == "On Time" and is_on_time:
             correct = True
             coins = 20
@@ -133,12 +138,15 @@ def resolve_bets(api_key, target_date):
         elif bet_type == "Cancelled" and is_cancelled:
             correct = True
             coins = 60
+        
         if not correct:
             coins = -10
+        
         c.execute("UPDATE users SET skycoins = skycoins + ? WHERE username = ?", (coins, user))
         c.execute("UPDATE bets SET outcome = ? WHERE username = ? AND flight_id = ?",
                   ('correct' if correct else 'wrong', user, flight_id))
         updated += 1
+    
     conn.commit()
     return updated
 
@@ -148,9 +156,11 @@ def get_user_level(username):
     total = c.fetchone()[0]
     if total == 0:
         return "Cloud Hopper", 0.0
+    
     c.execute("SELECT COUNT(*) FROM bets WHERE username = ? AND outcome = 'correct'", (username,))
     correct = c.fetchone()[0]
     success_rate = (correct / total) * 100
+    
     if success_rate >= 85:
         level = "AVGeek"
     elif success_rate >= 70:
@@ -161,9 +171,10 @@ def get_user_level(username):
         level = "Wing Cadet"
     else:
         level = "Cloud Hopper"
+    
     return level, success_rate
 
-# ---------------- Main App UI ----------------
+# ---------------- UI ----------------
 st.set_page_config(page_title="SkyStake", layout="wide")
 
 st.markdown("""
@@ -179,7 +190,7 @@ st.markdown("""
 
 st.title("✈️ SkyStake – Stake SkyCoins on Real Flights ✈️")
 
-# Show API key status (you already have this)
+# API key status
 try:
     api_key = st.secrets["AVIATIONSTACK_API_KEY"]
     st.sidebar.success(f"API key loaded from secrets (length: {len(api_key)})")
@@ -229,11 +240,11 @@ if st.session_state.user:
         st.session_state.user = None
         st.rerun()
 
-    st.subheader(f"Live Manchester Departures – {today_str}")
+    st.subheader(f"Current Manchester Departures – {today_str}")
 
     if st.button("🔄 Refresh Live Flights"):
         if api_key:
-            st.session_state.flights = fetch_departures(api_key, today_str)
+            st.session_state.flights = fetch_departures(api_key)
         else:
             st.error("No API key available.")
 
@@ -241,7 +252,7 @@ if st.session_state.user:
 
     if flights_df is not None:
         if flights_df.empty:
-            st.info("No flights loaded (see debug messages above).")
+            st.info("No current flights loaded (check debug messages above).")
         else:
             for _, row in flights_df.iterrows():
                 st.markdown(f"""
@@ -254,17 +265,13 @@ if st.session_state.user:
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Bet placement (simplified for brevity)
-            st.subheader("Place a Stake")
-            st.info("Bet placement form would go here...")
-
-    # Resolution button
-    st.subheader("Admin Tools")
+    # Resolution (using real-time data – note: may not have final results for past flights)
+    st.subheader("Resolve Today's Bets")
     if st.button("Run Daily Resolution"):
         if api_key:
             count = resolve_bets(api_key, today_str)
-            st.success(f"Resolved {count} bets")
+            st.success(f"Resolved {count} bets • SkyCoins updated!")
         else:
             st.error("No API key")
 
-st.caption("SkyStake debug version • AviationStack data • March 2026")
+st.caption("SkyStake • Real-time mode (free tier) • AviationStack • March 2026")
