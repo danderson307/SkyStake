@@ -28,7 +28,7 @@ ROUTE_RATINGS = {
 # ---------------- Fetch Departures ----------------
 @st.cache_data(ttl=1800)
 def fetch_departures(api_key, flight_date_str):
-    url = "https://api.aviationstack.com/v1/flights"
+    url = "http://api.aviationstack.com/v1/flights"
     params = {'access_key': api_key, 'dep_iata': 'MAN', 'flight_date': flight_date_str, 'limit': 50}
     try:
         r = requests.get(url, params=params, timeout=10)
