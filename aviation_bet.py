@@ -2,8 +2,8 @@ import streamlit as st
 import requests
 import sqlite3
 import pandas as pd
-from datetime import date
-from dateutil import parser as date_parser
+from datetime import date, datetime
+from dateutil import parser
 
 # ---------------- DB Setup ----------------
 conn = sqlite3.connect('skystake.db', check_same_thread=False)
@@ -28,7 +28,7 @@ ROUTE_RATINGS = {
 # ---------------- Fetch Current Real-Time Departures ----------------
 @st.cache_data(ttl=1800, show_spinner="Fetching current Manchester departures...")
 def fetch_departures(api_key):
-    url = "https://api.aviationstack.com/v1/flights"  # HTTPS preferred; fallback http if restricted
+    url = "https://api.aviationstack.com/v1/flights"
 
     params = {
         'access_key': api_key,
@@ -38,23 +38,17 @@ def fetch_departures(api_key):
     
     try:
         r = requests.get(url, params=params, timeout=10)
-        
-        st.write("**API Debug (remove later)**")
-        st.write("Status Code:", r.status_code)
         if r.status_code != 200:
-            st.error(f"API Error {r.status_code}: {r.text[:400]}...")
             return pd.DataFrame()
         
         data = r.json()
         if 'data' not in data:
-            st.warning("No 'data' in response.")
             return pd.DataFrame()
         
         flights = []
         for f in data['data']:
-            # Skip codeshares (keep only primary/operating flights)
             if f.get('flight', {}).get('codeshared') is not None:
-                continue  # Exclude if it's a codeshare record
+                continue
             
             dep = f.get('departure', {})
             status = f.get('flight_status', 'unknown').capitalize()
@@ -62,7 +56,7 @@ def fetch_departures(api_key):
             rating = ROUTE_RATINGS.get(dest_iata, ROUTE_RATINGS['DEFAULT'])
             
             scheduled_str = dep.get('scheduled')
-            scheduled_time = date_parser.parse(scheduled_str) if scheduled_str else None
+            scheduled_time = parser.parse(scheduled_str) if scheduled_str else datetime.max
             
             flights.append({
                 'flight_id': f['flight'].get('iata', 'N/A'),
@@ -70,7 +64,7 @@ def fetch_departures(api_key):
                 'destination': f['arrival'].get('airport', 'Unknown'),
                 'dest_iata': dest_iata,
                 'scheduled': scheduled_str,
-                'scheduled_dt': scheduled_time,  # For sorting
+                'scheduled_dt': scheduled_time,
                 'estimated': dep.get('estimated'),
                 'actual': dep.get('actual'),
                 'delay_min': dep.get('delay'),
@@ -81,20 +75,92 @@ def fetch_departures(api_key):
         
         df = pd.DataFrame(flights)
         if not df.empty:
-            # Sort by scheduled departure time (soonest first)
             df = df.sort_values('scheduled_dt').reset_index(drop=True)
-            st.success(f"Loaded {len(df)} unique departures (codeshares excluded)!")
-        return df.drop(columns=['scheduled_dt'])  # Clean up temp column
+        return df.drop(columns=['scheduled_dt'], errors='ignore')
     
-    except Exception as e:
-        st.error(f"Fetch error: {str(e)}")
+    except:
         return pd.DataFrame([])
 
-# ---------------- Resolve Bets (simplified, using real-time) ----------------
-# ... (keep your existing resolve_bets function here; unchanged for now)
+# ---------------- Resolve Bets ----------------
+def resolve_bets(api_key, target_date):
+    flights_df = fetch_departures(api_key)
+    if flights_df.empty:
+        return 0
+    
+    flight_map = {row['flight_id']: row for _, row in flights_df.iterrows()}
+    updated = 0
+    
+    c.execute("SELECT username, flight_id, bet_type, delay_range FROM bets WHERE bet_date = ? AND outcome = 'pending'", (target_date,))
+    for user, flight_id, bet_type, delay_range in c.fetchall():
+        if flight_id not in flight_map:
+            continue
+        f = flight_map[flight_id]
+        status = f['status']
+        delay_min = f['delay_min'] if f['delay_min'] is not None else 0
+        
+        if delay_min == 0 and f['actual'] and f['scheduled']:
+            try:
+                sched = parser.parse(f['scheduled'])
+                act = parser.parse(f['actual'])
+                delay_min = max(0, (act - sched).total_seconds() / 60)
+            except:
+                pass
+        
+        is_cancelled = status == 'Cancelled'
+        is_on_time = not is_cancelled and delay_min <= 15
+        is_delayed = not is_cancelled and delay_min > 15
+        
+        correct = False
+        coins = 0
+        
+        if bet_type == "On Time" and is_on_time:
+            correct = True
+            coins = 20
+        elif bet_type == "Delayed" and is_delayed:
+            correct = True
+            coins = 30
+            if delay_range:
+                if "Under 20" in delay_range and 15 < delay_min <= 20: coins += 10
+                elif "20–60" in delay_range and 20 < delay_min <= 60: coins += 10
+                elif ">60" in delay_range and delay_min > 60: coins += 10
+        elif bet_type == "Cancelled" and is_cancelled:
+            correct = True
+            coins = 60
+        
+        if not correct:
+            coins = -10
+        
+        c.execute("UPDATE users SET skycoins = skycoins + ? WHERE username = ?", (coins, user))
+        c.execute("UPDATE bets SET outcome = ? WHERE username = ? AND flight_id = ?",
+                  ('correct' if correct else 'wrong', user, flight_id))
+        updated += 1
+    
+    conn.commit()
+    return updated
 
 # ---------------- Level Calculation ----------------
-# ... (keep your existing get_user_level function)
+def get_user_level(username):
+    c.execute("SELECT COUNT(*) FROM bets WHERE username = ? AND outcome != 'pending'", (username,))
+    total = c.fetchone()[0]
+    if total == 0:
+        return "Cloud Hopper", 0.0
+    
+    c.execute("SELECT COUNT(*) FROM bets WHERE username = ? AND outcome = 'correct'", (username,))
+    correct = c.fetchone()[0]
+    success_rate = (correct / total) * 100 if total > 0 else 0.0
+    
+    if success_rate >= 85:
+        level = "AVGeek"
+    elif success_rate >= 70:
+        level = "Senior Captain"
+    elif success_rate >= 50:
+        level = "First Officer"
+    elif success_rate >= 30:
+        level = "Wing Cadet"
+    else:
+        level = "Cloud Hopper"
+    
+    return level, success_rate
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="SkyStake", layout="wide")
@@ -112,11 +178,11 @@ st.markdown("""
 
 st.title("✈️ SkyStake – Stake SkyCoins on Real Flights ✈️")
 
+# API key (from secrets or fallback sample)
 try:
     api_key = st.secrets["AVIATIONSTACK_API_KEY"]
-    st.sidebar.success(f"API key loaded (length: {len(api_key)})")
 except:
-    st.sidebar.error("Secrets error – check Streamlit Cloud settings.")
+    st.sidebar.warning("No API key found in secrets – using sample data.")
     api_key = None
 
 if 'user' not in st.session_state:
@@ -132,9 +198,9 @@ with st.sidebar:
             c.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
             if c.fetchone():
                 st.session_state.user = username
-                st.success("Welcome back!")
+                st.success("Logged in!")
             else:
-                st.error("Invalid.")
+                st.error("Invalid credentials.")
     with col2:
         if st.button("Register"):
             try:
@@ -143,7 +209,7 @@ with st.sidebar:
                 st.session_state.user = username
                 st.success("Registered!")
             except:
-                st.error("Callsign taken.")
+                st.error("Username taken.")
 
 if st.session_state.user:
     user = st.session_state.user
@@ -152,7 +218,7 @@ if st.session_state.user:
     c.execute("SELECT skycoins FROM users WHERE username=?", (user,))
     skycoins = c.fetchone()[0] or 500
 
-    level, success_pct = get_user_level(user)  # your function
+    level, success_pct = get_user_level(user)
 
     st.sidebar.markdown(f"**Callsign:** {user}")
     st.sidebar.markdown(f"**SkyCoins:** **{skycoins}**")
@@ -161,21 +227,34 @@ if st.session_state.user:
         st.session_state.user = None
         st.rerun()
 
-    st.subheader(f"Current Manchester (MAN) Departures – {today_str}")
+    # Additional feature: Show user's current bets
+    st.sidebar.subheader("Your Bets Today")
+    c.execute("SELECT flight_id, bet_type, delay_range, outcome FROM bets WHERE username=? AND bet_date=?", (user, today_str))
+    current_bets = c.fetchall()
+    if current_bets:
+        for bet in current_bets:
+            st.sidebar.markdown(f"- {bet[0]}: {bet[1]} ({bet[2]}) – {bet[3].capitalize()}")
+    else:
+        st.sidebar.info("No bets placed yet today.")
 
-    if st.button("🔄 Refresh Live Flights"):
-        if api_key:
-            st.session_state.flights = fetch_departures(api_key)
-        else:
-            st.error("No API key.")
+    st.subheader(f"Current Manchester Departures – {today_str}")
+
+    if st.button("🔄 Refresh Flights"):
+        st.session_state.flights = fetch_departures(api_key) if api_key else pd.DataFrame([
+            {'flight_id': 'FR123', 'airline': 'Ryanair', 'destination': 'Dublin', 'dest_iata': 'DUB', 'scheduled': '2026-03-04T08:00:00+00:00', 'status': 'Scheduled', 'status_emoji': '🛫', 'otp_rating': '84% • Avg 12 min • Low'},
+            {'flight_id': 'BA456', 'airline': 'British Airways', 'destination': 'London Heathrow', 'dest_iata': 'LHR', 'scheduled': '2026-03-04T09:00:00+00:00', 'status': 'Scheduled', 'status_emoji': '🛫', 'otp_rating': '72% • Avg 22 min • Medium'},
+        ])
 
     flights_df = st.session_state.get('flights', pd.DataFrame())
 
     if not flights_df.empty:
-        # Display sorted flights as cards
         for _, row in flights_df.iterrows():
+            # Additional feature: Highlight upcoming flights (green if scheduled > now)
+            now = datetime.utcnow()
+            sched = parser.parse(row['scheduled']) if row['scheduled'] else now
+            color = "#88ff88" if sched > now else "#ff8888"
             st.markdown(f"""
-            <div class="card">
+            <div class="card" style="border-left: 5px solid {color};">
                 <h3><i class="fa fa-plane-departure"></i> {row['flight_id']} – {row['airline']}</h3>
                 <p><strong>To:</strong> {row['destination']} ({row['dest_iata']})</p>
                 <p><strong>Scheduled:</strong> {row['scheduled'][-14:-6] if row['scheduled'] else 'N/A'}</p>
@@ -184,46 +263,49 @@ if st.session_state.user:
             </div>
             """, unsafe_allow_html=True)
 
-        # Bet placement
         c.execute("SELECT COUNT(*) FROM bets WHERE username=? AND bet_date=? AND outcome='pending'", (user, today_str))
         pending_bets = c.fetchone()[0]
 
         if pending_bets < 5:
-            st.subheader(f"Place a Stake ({5 - pending_bets} remaining today)")
+            st.subheader(f"Place a Stake ({5 - pending_bets} left today)")
             with st.form("bet_form"):
-                # Select flight
                 flight_options = [f"{row['flight_id']} → {row['dest_iata']} ({row['scheduled'][-14:-6] or 'N/A'})" for _, row in flights_df.iterrows()]
-                selected_option = st.selectbox("Select Flight to Bet On", flight_options)
+                selected_option = st.selectbox("Select Flight", flight_options)
                 
                 if selected_option:
                     selected_flight_id = selected_option.split(" → ")[0]
-
-                    bet_type = st.radio("Your Prediction", ["On Time (<15 min delay)", "Delayed", "Cancelled"])
-
-                    delay_range = ""
-                    if bet_type == "Delayed":
-                        delay_range = st.selectbox("Expected Delay Range", ["Under 20 min", "20–60 min", ">60 min"])
-
-                    submitted = st.form_submit_button("Place Bet ✈️")
-                    if submitted:
-                        c.execute("INSERT OR REPLACE INTO bets (username, flight_id, bet_type, delay_range, bet_date, outcome) VALUES (?,?,?,?,?,'pending')",
-                                  (user, selected_flight_id, bet_type, delay_range, today_str))
-                        conn.commit()
-                        st.success(f"Bet placed on **{selected_flight_id}**! Good luck.")
-                        st.rerun()
+                    bet_type = st.radio("Prediction", ["On Time (<15 min delay)", "Delayed", "Cancelled"])
+                    delay_range = "" if bet_type != "Delayed" else st.selectbox("Delay Range", ["Under 20 min", "20–60 min", ">60 min"])
+                    
+                    if st.form_submit_button("Place Bet ✈️"):
+                        # Validation: Can't bet on past flights
+                        sched = flights_df[flights_df['flight_id'] == selected_flight_id]['scheduled'].iloc[0]
+                        if sched and parser.parse(sched) < datetime.utcnow():
+                            st.error("Cannot bet on past flights.")
+                        else:
+                            c.execute("INSERT OR REPLACE INTO bets VALUES (?, ?, ?, ?, ?, 'pending')",
+                                      (user, selected_flight_id, bet_type, delay_range, today_str))
+                            conn.commit()
+                            st.success(f"Bet placed on {selected_flight_id}!")
+                            st.rerun()
         else:
-            st.warning("You've reached your 5 daily bets. Come back tomorrow!")
+            st.warning("Max 5 bets today.")
 
     else:
-        st.info("No flights loaded yet. Press refresh (check debug above if issues).")
+        st.info("No flights available. Try refreshing.")
 
-    # Resolution button (keep as-is)
-    st.subheader("Resolve Bets (Admin)")
-    if st.button("Run Resolution for Today"):
-        if api_key:
-            count = resolve_bets(api_key, today_str)  # your function
-            st.success(f"Resolved {count} pending bets!")
-        else:
-            st.error("No API key.")
+    # Additional feature: Leaderboard in main UI
+    st.subheader("Global Leaderboard")
+    leaders = pd.read_sql("SELECT username, skycoins FROM users ORDER BY skycoins DESC LIMIT 10", conn)
+    for i, row in leaders.iterrows():
+        lvl, _ = get_user_level(row['username'])
+        emoji = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"{i+1}."
+        st.markdown(f"{emoji} **{row['username']}** – {row['skycoins']} SkyCoins ({lvl})")
 
-st.caption("SkyStake • Real-time departures only (free tier) • Codeshares excluded • Sorted soonest first")
+    # Resolution
+    st.subheader("Resolve Bets")
+    if st.button("Resolve Today's Bets"):
+        count = resolve_bets(api_key, today_str) if api_key else 0
+        st.success(f"Resolved {count} bets.")
+
+st.caption("SkyStake v1.0 • Real-time Aviation Betting • Powered by AviationStack")
